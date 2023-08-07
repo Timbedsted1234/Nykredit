@@ -1,0 +1,304 @@
+
+/* cas mySession terminate; */
+cas mySession sessopts=(timeout=3500000);
+caslib _all_ assign;
+options casdatalimit=20000M;
+
+%LET ANALYSE_TABEL=OKONOMI_KORR;
+%LET VIYA_LIBRARY=RAT_DATA; 
+%LET TABEL_NAVN=VARIABEL_BESKRIVELSE; 
+
+
+/* Load dataset */
+data casuser.&ANALYSE_TABEL. ( REPLACE=yes);
+set &VIYA_LIBRARY..&ANALYSE_TABEL.;
+run;
+
+/* Use the Data Discovery Action Set */
+proc cas;
+   loadactionset / actionSet="dataDiscovery";         /* 1: use dataDiscovery actionSet */
+   run;
+   dataDiscovery.profile result=r /                   /* 2: generate output dataset */
+       table={name="&ANALYSE_TABEL."}, 
+       casOut={name="&TABEL_NAVN._ORG"};
+   run;
+
+   table.fetch /                                      /* 3: check output for ColumnId==0*/
+   table={name="&TABEL_NAVN._ORG"
+          where="0 = ColumnId"
+    }
+    to=9999;
+run;
+quit;
+
+/*Tilføjer kolonnenavn ud fra kolonne id  */
+PROC FEDSQL SESSREF=MYSESSION;
+drop table CASUSER.&TABEL_NAVN._COLNAME FORCE;
+CREATE TABLE CASUSER.&TABEL_NAVN._COLNAME AS SELECT 
+NAME.CHARVALUE AS COL_NAME 
+,VAR.*
+
+FROM CASUSER.&TABEL_NAVN._ORG AS VAR
+
+LEFT JOIN (SELECT CHARVALUE, COLUMNID  FROM CASUSER.&TABEL_NAVN._ORG WHERE ROWID=1000)  AS NAME
+ON VAR.COLUMNID=NAME.COLUMNID
+
+WHERE NAME.CHARVALUE IS NOT NULL OR ROWID<12
+; 
+QUIT; 
+
+ 
+/* BEREGNE KURTOSIS, SKEWNESS og KVARTILER TIL VA RAPPORTEN */
+
+
+%macro hop(FUNKTION,ROWID);
+PROC SQL ;
+SELECT 
+CAT("&FUNKTION.(",STRIP(name),") AS ",STRIP(NAME))
+INTO: VARS SEPARATED BY ", "
+FROM SASHELP.VCOLUMN
+WHERE LIBNAME = "&VIYA_LIBRARY."
+AND MEMNAME = "&ANALYSE_TABEL."
+AND TYPE="num"
+AND FORMAT NOT IN ("DATE9.","DATETIME20.")
+;
+QUIT;
+%PUT &VARS.;
+
+ 
+
+PROC FEDSQL SESSREF=mySession;
+drop table casuser.&FUNKTION. FORCE;
+CREATE TABLE casuser.&FUNKTION. AS SELECT 
+&VARS.
+FROM &VIYA_LIBRARY..&ANALYSE_TABEL.
+;
+QUIT;
+
+
+PROC TRANSPOSE DATA=casuser.&FUNKTION. OUT=&FUNKTION.; RUN;
+
+data casuser.&FUNKTION._TEMP ( REPLACE=yes);
+set &FUNKTION. (rename=(COL1 = DoubleValue));
+ length CharValue varchar(3000) COL_NAME varchar(50);
+RowID = &ROWID.; 
+CharValue = "&FUNKTION.";
+COL_NAME = _NAME_;
+KEEP COL_NAME RoWId CHARVALUE DOUBLEVALUE ;
+run;
+
+PROC FEDSQL SESSREF=MYSESSION;
+drop table CASUSER.&FUNKTION. FORCE;
+CREATE TABLE CASUSER.&FUNKTION. AS SELECT 
+NAME.COLUMNID AS COLUMNID 
+,FUNK.*
+
+FROM CASUSER.&FUNKTION._TEMP AS FUNK
+
+LEFT JOIN (SELECT COL_NAME, CHARVALUE, COLUMNID  FROM CASUSER.&TABEL_NAVN._COLNAME WHERE ROWID=1000)  AS NAME
+ON FUNK.COL_NAME=NAME.COL_NAME
+
+WHERE NAME.CHARVALUE IS NOT NULL OR ROWID<12
+; 
+QUIT; 
+
+
+
+%mend hop;
+
+%hop(KURTOSIS,999);
+%hop(SKEWNESS,998);
+
+/*Kurtosis og skewness i en */
+PROC FEDSQL SESSREF=MYSESSION;
+drop table CASUSER.KURT_SKEW FORCE;
+CREATE TABLE CASUSER.KURT_SKEW AS SELECT 
+KUR.COL_NAME 
+,KUR.DOUBLEVALUE
+,SKEW.DOUBLEVALUE AS COUNT
+,899 AS ROWID
+,'Kurtosis is double value and skewness is count' AS CHARVALUE
+
+FROM CASUSER.KURTOSIS AS KUR
+
+LEFT JOIN CASUSER.SKEWNESS AS SKEW
+ON KUR.COL_NAME=SKEW.COL_NAME
+
+; 
+QUIT; 
+
+/*Completeness  */
+/*Finds number of rows and calculate completeness, when data is put together  */
+/*Colmpleteness=missing/number of rows.   */
+PROC SQL; 
+SELECT COUNT 
+INTO : NUMBER_OF_ROWS
+
+FROM CASUSER.&TABEL_NAVN._COLNAME
+WHERE ROWID=1
+; 
+QUIT; 
+data casuser.COMPLETENESS ( REPLACE=yes);
+set CASUSER.&TABEL_NAVN._COLNAME;
+WHERE ROWID=1014; 
+
+DOUBLEVALUE=SUM(&NUMBER_OF_ROWS.,-COUNT)/&NUMBER_OF_ROWS.;
+
+RowID = 898;
+CharValue = "Completeness";
+run;
+
+
+
+/*Udregner kvartiler  */
+PROC SQL ;
+SELECT 
+NAME
+,NAME
+,NAME
+,COUNT(NAME)
+INTO
+	: VARS SEPARATED BY " "
+	,: VARS_IN SEPARATED BY '" "'
+	,: VAR_1-
+	,: ANTAL
+FROM SASHELP.VCOLUMN
+WHERE LIBNAME = "&VIYA_LIBRARY."
+AND MEMNAME = "&ANALYSE_TABEL."
+AND TYPE="num"
+AND FORMAT NOT IN ("DATE9.","DATETIME20.")
+;
+QUIT;
+%PUT &VARS. &VARS_IN. &ANTAL. &VAR_1. &VAR_2.;
+
+
+%macro LOOP;
+%DO I=1 %TO &ANTAL.; 
+
+proc univariate data = &VIYA_LIBRARY..&ANALYSE_TABEL. noprint;
+var &&VAR_&I..;
+output out=QUARTILES_&I. PCTLPTS = 25 75 PCTLPRE = _ ;
+run;
+
+PROC TRANSPOSE DATA=QUARTILES_&I. OUT=QUARTILES_TRANS_&I.; RUN;
+
+DATA CASUSER.QUARTILES_TRANS_&I.( REPLACE=yes); 
+SET QUARTILES_TRANS_&I.;
+length name $50 COL_NAME CharValue  varchar(3000);
+COL_NAME="&&VAR_&I..";
+DOUBLEVALUE=COL1; 
+IF _NAME_="_25" THEN ROWID=25;
+ELSE IF _NAME_="_75" THEN ROWID=75;
+CHARVALUE=_LABEL_;
+
+KEEP COL_NAME DOUBLEVALUE ROWID CHARVALUE;
+RUN; 
+%END; 
+
+
+
+DATA CASUSER.QUARTILES( REPLACE=yes);  ; 
+SET 
+%DO I=1 %TO &ANTAL.; 
+	CASUSER.QUARTILES_TRANS_&I.
+%END;
+;
+RUN; 
+
+%MEND; 
+%LOOP
+
+/*Laver kode til formeleditor */
+data CASUSER.MEASURE ( REPLACE=yes);
+set CASUSER.&TABEL_NAVN._COLNAME; 
+WHERE RowID = 1000 AND COL_NAME IN ("&VARS_IN.");
+
+MEASURE=CAT("IF ('ColumnID Parameter'p = '",col_name,"') RETURN '",col_name,"'n ");
+run; 
+
+
+proc sql; 
+select
+MEASURE
+," "
+INTO: MEASURE SEPARATED BY " ELSE ( "
+	,: ANTAL SEPARATED BY " ) " 
+from CASUSER.MEASURE
+;
+QUIT;
+
+data CASUSER.MEASURE_TABLE ( REPLACE=yes);
+set CASUSER.&TABEL_NAVN._COLNAME (DROP= CharValue); 
+WHERE RowID = 0;
+length CharValue varchar(3000);
+
+CHARVALUE=CAT("&MEASURE."," ELSE 0 &ANTAL.");
+ROWID=799;
+COUNT=.; 
+run; 
+
+
+/*Samlet alt data  */
+data CASUSER.&TABEL_NAVN._SAMLET ( REPLACE=yes);
+length  COL_NAME VARCHAR(50) CharValue  varchar(3000);
+set CASUSER.&TABEL_NAVN._COLNAME 
+	CASUSER.KURTOSIS 
+	CASUSER.SKEWNESS 
+	CASUSER.KURT_SKEW 
+	CASUSER.QUARTILES 
+	CASUSER.COMPLETENESS
+	CASUSER.MEASURE_TABLE
+;
+run;
+
+
+/* Add ColumnID to new added rowIds*/
+
+PROC FEDSQL SESSREF=MYSESSION;
+drop table CASUSER.COLUNMIDS FORCE;
+CREATE TABLE CASUSER.COLUNMIDS AS SELECT 
+COL_NAME
+,COLUMNID
+FROM CASUSER.&TABEL_NAVN._SAMLET 
+WHERE RowID = 1000
+;
+QUIT;
+
+PROC FEDSQL SESSREF=MYSESSION;
+drop table CASUSER.&TABEL_NAVN. FORCE;
+CREATE TABLE CASUSER.&TABEL_NAVN. AS SELECT 
+ORG.COL_NAME
+,ORG.CharValue
+,ORG.RowId
+,ORG.Count
+,ORG.DoubleValue
+,MAX.COLUMNID
+FROM CASUSER.&TABEL_NAVN._SAMLET AS ORG
+LEFT JOIN CASUSER.COLUNMIDS AS MAX
+ON ORG.COL_NAME = MAX.COL_NAME 
+;
+QUIT;
+
+
+/* Promote resulting profile to CASLIB in order to visualize results in VA */
+
+	proc casutil  incaslib="casuser" outcaslib="&VIYA_LIBRARY." ;    
+		save casdata="&TABEL_NAVN." replace; 
+		DROPTABLE CASDATA="&TABEL_NAVN." INCASLIB="&VIYA_LIBRARY." QUIET;
+		load casdata="&TABEL_NAVN..sashdat" 
+		casout="&TABEL_NAVN." 	
+		incaslib="&VIYA_LIBRARY."  promote;
+	run; 
+
+
+/*Upload af den fulde orginal tabeltabel  */
+    proc casutil  incaslib="&VIYA_LIBRARY." outcaslib="&VIYA_LIBRARY." ;    
+		save casdata="&TABEL_NAVN._DATA" replace; 
+		DROPTABLE CASDATA="&TABEL_NAVN._DATA" INCASLIB="&VIYA_LIBRARY." QUIET;
+		load casdata="&ANALYSE_TABEL..sashdat" 
+		casout="&TABEL_NAVN._DATA" 	
+		incaslib="&VIYA_LIBRARY."  promote;
+	run; 
+       
+
+
